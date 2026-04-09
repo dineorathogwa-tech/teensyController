@@ -1,0 +1,13 @@
+{
+	"folders": [
+		{
+			"name": "ripc_ws",
+			"path": "../../../../ripc_ws"
+		},
+		{
+			"name": "teensyController",
+			"path": "."
+		}
+	],
+	"settings": {}
+}
