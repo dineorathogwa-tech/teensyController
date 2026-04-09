@@ -24,18 +24,16 @@ rcl_node_t node;
 rclc_executor_t executor;
 rcl_timer_t timer_imu;
 
-// Static Frame IDs to save CPU cycles
 static char gps_frame[] = "gps_link";
 static char imu_frame[] = "imu_link";
 
-// Scale factors for raw BNO055 data
 const float QUAT_SCALE = 1.0 / (1 << 14);
 const float ACCEL_SCALE = 1.0 / 100.0;
 const float GYRO_SCALE = 1.0 / 900.0;
 
 #define RCCHECK(fn) { rcl_ret_t temp_rc = fn; if((temp_rc != RCL_RET_OK)){while(1);}}
 
-// --- GPS Callback (UART Binary Stream) ---
+// --- GPS Callback ---
 void pvtCallback(UBX_NAV_PVT_data_t *ubxDataStruct) {
   int64_t time_ns = rmw_uros_epoch_nanos();
   msg_gps.header.stamp.sec = time_ns / 1000000000;
@@ -49,29 +47,25 @@ void pvtCallback(UBX_NAV_PVT_data_t *ubxDataStruct) {
   rcl_publish(&pub_gps, &msg_gps, NULL);
 }
 
-// --- MEGA-BURST I2C READ (Registers 0x14 to 0x2D) ---
-// This reads Gyro, Quat, and Accel in ONE single bus transaction.
+// --- MEGA-BURST I2C READ ---
 bool read_imu_mega_burst() {
   uint8_t buf[26];
   Wire.beginTransmission(0x28);
-  Wire.write(0x14); // Start at Gyro LSB
+  Wire.write(0x14); 
   if (Wire.endTransmission() != 0) return false;
   
   if (Wire.requestFrom(0x28, 26) != 26) return false;
   for(int i=0; i<26; i++) buf[i] = Wire.read();
 
-  // Parse Gyro (0x14-0x19)
   msg_imu.angular_velocity.x = ((int16_t)((buf[1]<<8)|buf[0])) * GYRO_SCALE;
   msg_imu.angular_velocity.y = ((int16_t)((buf[3]<<8)|buf[2])) * GYRO_SCALE;
   msg_imu.angular_velocity.z = ((int16_t)((buf[5]<<8)|buf[4])) * GYRO_SCALE;
 
-  // Parse Quat (0x20-0x27) - note the offset in buffer
   msg_imu.orientation.w = ((int16_t)((buf[13]<<8)|buf[12])) * QUAT_SCALE;
   msg_imu.orientation.x = ((int16_t)((buf[15]<<8)|buf[14])) * QUAT_SCALE;
   msg_imu.orientation.y = ((int16_t)((buf[17]<<8)|buf[16])) * QUAT_SCALE;
   msg_imu.orientation.z = ((int16_t)((buf[19]<<8)|buf[18])) * QUAT_SCALE;
 
-  // Parse Accel (0x28-0x2D)
   msg_imu.linear_acceleration.x = ((int16_t)((buf[21]<<8)|buf[20])) * ACCEL_SCALE;
   msg_imu.linear_acceleration.y = ((int16_t)((buf[23]<<8)|buf[22])) * ACCEL_SCALE;
   msg_imu.linear_acceleration.z = ((int16_t)((buf[25]<<8)|buf[24])) * ACCEL_SCALE;
@@ -90,27 +84,25 @@ void imu_timer_callback(rcl_timer_t * timer, int64_t last_call_time) {
 }
 
 void setup() {
-  // 1. GPS Startup
+  // 1. Hardware Buffers & GPS Startup
+  // Adding 1KB buffer to Serial1 to prevent overflows during I2C/ROS operations
+  Serial1.addMemoryForRead(new uint8_t[1024], 1024);
   Serial1.begin(115200);
   while(!myGNSS.begin(Serial1)) delay(100);
 
-  // 2. GPS CONFIGURATION
-  // This forces the GPS to ONLY talk in binary UBX, which is much faster than text NMEA
   myGNSS.setUART1Output(COM_TYPE_UBX); 
-  
   myGNSS.setNavigationFrequency(10); 
   myGNSS.setDynamicModel(DYN_MODEL_SEA);
-  
-  // If setInfMessages is missing, we use this to ensure only the PVT data comes through
   myGNSS.setAutoPVT(true);
   myGNSS.setAutoPVTcallbackPtr(&pvtCallback); 
-  
-  // This ensures the settings are "burned" into the GPS RAM/Flash
   myGNSS.saveConfiguration();
 
-  // 2. IMU Startup
+  // 2. IMU Startup & I2C Safety
   Wire.begin();
   Wire.setClock(400000); 
+  // Safety timeout: prevent I2C hang from blocking the GPS loop
+  Wire.setTimeout(3000); 
+  
   while(!bno.begin()) delay(100);
   bno.setExtCrystalUse(true);
 
@@ -128,19 +120,23 @@ void setup() {
   msg_imu.header.frame_id.data = imu_frame;
   msg_imu.header.frame_id.size = strlen(imu_frame);
 
-  // Timer set to 20ms (50Hz)
+  // Timer set to 50Hz (20ms)
   RCCHECK(rclc_timer_init_default(&timer_imu, &support, RCL_MS_TO_NS(20), imu_timer_callback)); 
   RCCHECK(rclc_executor_init(&executor, &support.context, 1, &allocator));
   RCCHECK(rclc_executor_add_timer(&executor, &timer_imu));
 }
 
 void loop() {
-  // PRIORITY 1: Drain GPS as fast as hardware allows
+  // Pass 1: Drain GPS before ROS work
   while (myGNSS.checkUblox()) {
     myGNSS.checkCallbacks();
   }
 
-  // PRIORITY 2: ROS processing with ZERO blocking
-  // Setting timeout to 0 is CRITICAL to keep GPS from stuttering
+  // ROS work (Strict zero blocking)
   rclc_executor_spin_some(&executor, 0);
+
+  // Pass 2: Catch any bytes that arrived while ROS was publishing
+  while (myGNSS.checkUblox()) {
+    myGNSS.checkCallbacks();
+  }
 }
